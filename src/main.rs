@@ -77,6 +77,40 @@ impl Lsm6ds3 {
     }
 }
 
+struct Mmc5603;
+
+impl Mmc5603 {
+    const ADDR: u8 = 0x30;
+
+    fn init<I: embedded_hal::i2c::I2c, D: embedded_hal::delay::DelayNs>(
+        i2c: &mut I,
+        delay: &mut D,
+    ) -> Result<(), I::Error> {
+        i2c.write(Self::ADDR, &[0x1C, 0x80])?; // CTRL1: SW_RST
+        delay.delay_ms(20);
+        Ok(())
+    }
+
+    // Returns (x_mGauss, y_mGauss, z_mGauss)
+    fn read<I: embedded_hal::i2c::I2c, D: embedded_hal::delay::DelayNs>(
+        i2c: &mut I,
+        delay: &mut D,
+    ) -> Result<(i32, i32, i32), I::Error> {
+        i2c.write(Self::ADDR, &[0x1B, 0x01])?; // CTRL0: TM_M (trigger measurement)
+        delay.delay_ms(10);
+        let mut buf = [0u8; 9];
+        i2c.write_read(Self::ADDR, &[0x00], &mut buf)?;
+        let x_raw = ((buf[0] as u32) << 12) | ((buf[1] as u32) << 4) | ((buf[6] as u32) >> 4);
+        let y_raw = ((buf[2] as u32) << 12) | ((buf[3] as u32) << 4) | ((buf[6] as u32) & 0x0F);
+        let z_raw = ((buf[4] as u32) << 12) | ((buf[5] as u32) << 4) | ((buf[7] as u32) >> 4);
+        Ok((
+            ((x_raw as i32) - 524288) / 16, // 1/16 mG per LSB, offset from 2^19
+            ((y_raw as i32) - 524288) / 16,
+            ((z_raw as i32) - 524288) / 16,
+        ))
+    }
+}
+
 struct Sht30;
 
 impl Sht30 {
@@ -164,6 +198,7 @@ fn main() -> ! {
         clocks.system_clock.get_freq(),
     );
     Lsm6ds3::init(&mut i2c1).unwrap();
+    Mmc5603::init(&mut i2c1, &mut timer).unwrap();
 
     // LED mode state
     let mut blinking = true;
@@ -187,6 +222,12 @@ fn main() -> ! {
     let mut hum_pct: u32 = 0;
     let mut temp_ticks: u32 = 100;
 
+    // Magneto mode state (magneto_ticks starts at threshold for immediate first read)
+    let mut mx: i32 = 0;
+    let mut my: i32 = 0;
+    let mut mz: i32 = 0;
+    let mut magneto_ticks: u32 = 20;
+
     loop {
         let now: u64 = timer.get_counter().ticks();
 
@@ -197,6 +238,7 @@ fn main() -> ! {
                 button_prev_pressed = false;
                 gyro_ticks = 0;
                 temp_ticks = 100;
+                magneto_ticks = 20;
                 display_dirty = true;
             }
             Ok(Direction::CounterClockwise) => {
@@ -204,6 +246,7 @@ fn main() -> ! {
                 button_prev_pressed = false;
                 gyro_ticks = 0;
                 temp_ticks = 100;
+                magneto_ticks = 20;
                 display_dirty = true;
             }
             _ => {}
@@ -242,6 +285,18 @@ fn main() -> ! {
             }
         }
 
+        // Magneto mode: read sensor every ~200 ms
+        if MODES[mode_idx] == Mode::Magneto {
+            magneto_ticks += 1;
+            if magneto_ticks >= 20 {
+                magneto_ticks = 0;
+                if let Ok((x, y, z)) = Mmc5603::read(&mut i2c1, &mut timer) {
+                    mx = x; my = y; mz = z;
+                    display_dirty = true;
+                }
+            }
+        }
+
         // Temp mode: read sensor every ~1 s (temp_ticks starts at threshold for quick first read)
         if MODES[mode_idx] == Mode::Temp {
             temp_ticks += 1;
@@ -273,6 +328,17 @@ fn main() -> ! {
                     write!(xb, "X:{:>+7}", gx).ok();
                     write!(yb, "Y:{:>+7}", gy).ok();
                     write!(zb, "Z:{:>+7}", gz).ok();
+                    Text::new(&xb, Point::new(0, 35), status_style).draw(&mut display).unwrap();
+                    Text::new(&yb, Point::new(0, 47), status_style).draw(&mut display).unwrap();
+                    Text::new(&zb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
+                }
+                Mode::Magneto => {
+                    let mut xb: HString<16> = HString::new();
+                    let mut yb: HString<16> = HString::new();
+                    let mut zb: HString<16> = HString::new();
+                    write!(xb, "X:{:>+7}", mx).ok();
+                    write!(yb, "Y:{:>+7}", my).ok();
+                    write!(zb, "Z:{:>+7}", mz).ok();
                     Text::new(&xb, Point::new(0, 35), status_style).draw(&mut display).unwrap();
                     Text::new(&yb, Point::new(0, 47), status_style).draw(&mut display).unwrap();
                     Text::new(&zb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
