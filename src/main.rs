@@ -56,26 +56,46 @@ const MODES: &[Mode] = &[
     Mode::Optical, Mode::Pir, Mode::Buzz, Mode::Rgb,
 ];
 
-struct Lsm6ds3<I2C> { i2c: I2C }
+struct Lsm6ds3;
 
-impl<I2C: embedded_hal::i2c::I2c> Lsm6ds3<I2C> {
+impl Lsm6ds3 {
     const ADDR: u8 = 0x6A;
 
-    fn new(i2c: I2C) -> Self { Self { i2c } }
-
-    fn init(&mut self) -> Result<(), I2C::Error> {
-        self.i2c.write(Self::ADDR, &[0x11, 0x60])?; // CTRL2_G: 416 Hz ODR, ±250 dps
-        self.i2c.write(Self::ADDR, &[0x10, 0x60])   // CTRL1_XL: 416 Hz ODR, ±2 g
+    fn init<I: embedded_hal::i2c::I2c>(i2c: &mut I) -> Result<(), I::Error> {
+        i2c.write(Self::ADDR, &[0x11, 0x60])?; // CTRL2_G: 416 Hz ODR, ±250 dps
+        i2c.write(Self::ADDR, &[0x10, 0x60])   // CTRL1_XL: 416 Hz ODR, ±2 g
     }
 
-    fn read_gyro(&mut self) -> Result<(i16, i16, i16), I2C::Error> {
+    fn read_gyro<I: embedded_hal::i2c::I2c>(i2c: &mut I) -> Result<(i16, i16, i16), I::Error> {
         let mut buf = [0u8; 6];
-        self.i2c.write_read(Self::ADDR, &[0x22], &mut buf)?;
+        i2c.write_read(Self::ADDR, &[0x22], &mut buf)?;
         Ok((
             i16::from_le_bytes([buf[0], buf[1]]),
             i16::from_le_bytes([buf[2], buf[3]]),
             i16::from_le_bytes([buf[4], buf[5]]),
         ))
+    }
+}
+
+struct Sht30;
+
+impl Sht30 {
+    const ADDR: u8 = 0x44;
+
+    // Returns (temp_fahrenheit_x10, humidity_pct)
+    fn measure<I: embedded_hal::i2c::I2c, D: embedded_hal::delay::DelayNs>(
+        i2c: &mut I,
+        delay: &mut D,
+    ) -> Result<(i32, u32), I::Error> {
+        i2c.write(Self::ADDR, &[0x24, 0x00])?; // single-shot, high repeatability, no clock stretch
+        delay.delay_ms(20);
+        let mut buf = [0u8; 6];
+        i2c.read(Self::ADDR, &mut buf)?;
+        let t_raw = u16::from_be_bytes([buf[0], buf[1]]);
+        let h_raw = u16::from_be_bytes([buf[3], buf[4]]);
+        let t_x10 = (3150u32 * t_raw as u32 / 65535) as i32 - 490; // °F × 10
+        let h_pct = 100u32 * h_raw as u32 / 65535;
+        Ok((t_x10, h_pct))
     }
 }
 
@@ -135,7 +155,7 @@ fn main() -> ! {
     // I2C1 for IMU (GP14 SDA, GP15 SCL)
     let imu_sda = pins.gpio14.into_function();
     let imu_scl = pins.gpio15.into_function();
-    let i2c1 = hal::I2C::new_controller(
+    let mut i2c1 = hal::I2C::new_controller(
         pac.I2C1,
         imu_sda,
         imu_scl,
@@ -143,8 +163,7 @@ fn main() -> ! {
         &mut pac.RESETS,
         clocks.system_clock.get_freq(),
     );
-    let mut imu = Lsm6ds3::new(i2c1);
-    imu.init().unwrap();
+    Lsm6ds3::init(&mut i2c1).unwrap();
 
     // LED mode state
     let mut blinking = true;
@@ -163,6 +182,11 @@ fn main() -> ! {
     let mut gz: i16 = 0;
     let mut gyro_ticks: u32 = 0;
 
+    // Temp mode state (temp_ticks starts at threshold so first read is immediate)
+    let mut temp_x10: i32 = 0;
+    let mut hum_pct: u32 = 0;
+    let mut temp_ticks: u32 = 100;
+
     loop {
         let now: u64 = timer.get_counter().ticks();
 
@@ -172,12 +196,14 @@ fn main() -> ! {
                 mode_idx = (mode_idx + 1) % MODES.len();
                 button_prev_pressed = false;
                 gyro_ticks = 0;
+                temp_ticks = 100;
                 display_dirty = true;
             }
             Ok(Direction::CounterClockwise) => {
                 mode_idx = (mode_idx + MODES.len() - 1) % MODES.len();
                 button_prev_pressed = false;
                 gyro_ticks = 0;
+                temp_ticks = 100;
                 display_dirty = true;
             }
             _ => {}
@@ -209,8 +235,21 @@ fn main() -> ! {
             gyro_ticks += 1;
             if gyro_ticks >= 10 {
                 gyro_ticks = 0;
-                if let Ok((x, y, z)) = imu.read_gyro() {
+                if let Ok((x, y, z)) = Lsm6ds3::read_gyro(&mut i2c1) {
                     gx = x; gy = y; gz = z;
+                    display_dirty = true;
+                }
+            }
+        }
+
+        // Temp mode: read sensor every ~1 s (temp_ticks starts at threshold for quick first read)
+        if MODES[mode_idx] == Mode::Temp {
+            temp_ticks += 1;
+            if temp_ticks >= 100 {
+                temp_ticks = 0;
+                if let Ok((t, h)) = Sht30::measure(&mut i2c1, &mut timer) {
+                    temp_x10 = t;
+                    hum_pct = h;
                     display_dirty = true;
                 }
             }
@@ -237,6 +276,19 @@ fn main() -> ! {
                     Text::new(&xb, Point::new(0, 35), status_style).draw(&mut display).unwrap();
                     Text::new(&yb, Point::new(0, 47), status_style).draw(&mut display).unwrap();
                     Text::new(&zb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
+                }
+                Mode::Temp => {
+                    let mut tb: HString<16> = HString::new();
+                    let mut hb: HString<16> = HString::new();
+                    let (sign, t_abs) = if temp_x10 < 0 {
+                        ("-", (-temp_x10) as u32)
+                    } else {
+                        ("", temp_x10 as u32)
+                    };
+                    write!(tb, "{}{}.{}F", sign, t_abs / 10, t_abs % 10).ok();
+                    write!(hb, "{}%RH", hum_pct).ok();
+                    Text::new(&tb, Point::new(0, 42), label_style).draw(&mut display).unwrap();
+                    Text::new(&hb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
                 }
                 _ => {
                     let status = match mode {
