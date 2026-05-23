@@ -10,6 +10,7 @@ use core::fmt::Write;
 
 use rp235x_hal::clocks::ClockSource;
 use rp235x_hal::fugit::RateExtU32;
+use rp235x_hal::pio::PIOExt;
 use embedded_hal::pwm::SetDutyCycle;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use rotary_encoder_hal::{Direction, Rotary};
@@ -57,6 +58,20 @@ const MODES: &[Mode] = &[
     Mode::Led, Mode::Mic, Mode::Gyro, Mode::Magneto, Mode::Temp,
     Mode::Optical, Mode::Pir, Mode::Buzz, Mode::Rgb,
 ];
+
+/// HSV → RGB with S=255. Returns (r, g, b), each 0-v.
+fn hue_to_rgb(h: u8, v: u8) -> (u8, u8, u8) {
+    let region = h / 43;
+    let frac = ((h % 43) as u32 * v as u32 / 43) as u8;
+    match region {
+        0 => (v,        frac,    0),
+        1 => (v - frac, v,       0),
+        2 => (0,        v,       frac),
+        3 => (0,        v - frac,v),
+        4 => (frac,     0,       v),
+        _ => (v,        0,       v - frac),
+    }
+}
 
 struct Lsm6ds3;
 
@@ -250,6 +265,32 @@ fn main() -> ! {
     buzz_pwm.set_top(999u16);    // 1 MHz / 1000 = 1 kHz carrier
     let _buzz_pin = buzz_pwm.channel_b.output_to(pins.gpio27);
 
+    // WS2812 on GP22 via PIO0 SM0
+    // T1=3 T2=4 T3=3 (10 cycles/bit at 8 MHz → 800 kHz; 375ns/875ns timing, within WS2812B spec)
+    let ws2812_prog = pio_proc::pio_asm!(
+        ".side_set 1",
+        ".wrap_target",
+        "bitloop:",
+        "out x, 1       side 0 [2]",   // T3 cycles LOW, shift 1 bit into x
+        "jmp !x do_zero side 1 [2]",   // T1 cycles HIGH; jump if 0-bit
+        "jmp bitloop    side 1 [3]",   // T2 cycles HIGH (1-bit, loop)
+        "do_zero:",
+        "nop            side 0 [3]",   // T2 cycles LOW (0-bit)
+        ".wrap",
+    );
+    let _ws_pin = pins.gpio22.into_function::<hal::gpio::FunctionPio0>();
+    let (mut pio0, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
+    let installed = pio0.install(&ws2812_prog.program).unwrap();
+    let (mut sm0, _, mut ws_tx) = hal::pio::PIOBuilder::from_installed_program(installed)
+        .side_set_pin_base(22)
+        .out_shift_direction(hal::pio::ShiftDirection::Left)
+        .autopull(true)
+        .pull_threshold(24)
+        .clock_divisor_fixed_point(15u16, 160u8)
+        .build(sm0);
+    sm0.set_pindirs([(22u8, hal::pio::PinDir::Output)]);
+    sm0.start();
+
     // LED mode state
     let mut blinking = true;
     let mut led_state = false;
@@ -287,6 +328,11 @@ fn main() -> ! {
     // PIR mode state
     let mut pir_detected = false;
 
+    // RGB mode state
+    let mut rgb_hue: u8 = 0;
+    let mut rgb_ticks: u32 = 0;
+    let mut rgb_active = false;
+
     // Buzz mode state
     let mut buzz_duty: u16 = 0;
     let mut buzz_display_ticks: u32 = 0;
@@ -304,6 +350,8 @@ fn main() -> ! {
                 temp_ticks = 100;
                 magneto_ticks = 20;
                 optical_ticks = 20;
+                rgb_hue = 0;
+                rgb_ticks = 0;
                 buzz_duty = 0;
                 buzz_display_ticks = 0;
                 display_dirty = true;
@@ -315,6 +363,8 @@ fn main() -> ! {
                 temp_ticks = 100;
                 magneto_ticks = 20;
                 optical_ticks = 20;
+                rgb_hue = 0;
+                rgb_ticks = 0;
                 buzz_duty = 0;
                 buzz_display_ticks = 0;
                 display_dirty = true;
@@ -386,6 +436,23 @@ fn main() -> ! {
                 pir_detected = detected;
                 display_dirty = true;
             }
+        }
+
+        // RGB mode: cycle hue through rainbow, send to WS2812 on GP22
+        if MODES[mode_idx] == Mode::Rgb {
+            rgb_active = true;
+            rgb_ticks += 1;
+            if rgb_ticks >= 3 {  // update every ~30 ms
+                rgb_ticks = 0;
+                rgb_hue = rgb_hue.wrapping_add(10);
+                let (r, g, b) = hue_to_rgb(rgb_hue, 32);
+                let word = ((g as u32) << 24) | ((r as u32) << 16) | ((b as u32) << 8);
+                ws_tx.write(word);
+                display_dirty = true;
+            }
+        } else if rgb_active {
+            ws_tx.write(0u32); // send black once on mode exit
+            rgb_active = false;
         }
 
         // Buzz mode: sweep duty 0..999 over 2 seconds using timer; disable PWM when not active
@@ -480,6 +547,15 @@ fn main() -> ! {
                     write!(hb, "{}%RH", hum_pct).ok();
                     Text::new(&tb, Point::new(0, 42), label_style).draw(&mut display).unwrap();
                     Text::new(&hb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
+                }
+                Mode::Rgb => {
+                    let (r, g, b) = hue_to_rgb(rgb_hue, 32);
+                    let mut line1: HString<16> = HString::new();
+                    let mut line2: HString<16> = HString::new();
+                    write!(line1, "R:{:>3} G:{:>3}", r, g).ok();
+                    write!(line2, "B:{:>3} H:{:>3}", b, rgb_hue).ok();
+                    Text::new(&line1, Point::new(0, 40), status_style).draw(&mut display).unwrap();
+                    Text::new(&line2, Point::new(0, 55), status_style).draw(&mut display).unwrap();
                 }
                 Mode::Buzz => {
                     let bar_px = (buzz_duty as u32 * 126 / 999) as u32;
