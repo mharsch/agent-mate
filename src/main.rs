@@ -111,6 +111,43 @@ impl Mmc5603 {
     }
 }
 
+struct Ltr381rgb;
+
+impl Ltr381rgb {
+    const ADDR: u8 = 0x53;
+
+    fn init<I: embedded_hal::i2c::I2c>(i2c: &mut I) -> Result<(), I::Error> {
+        i2c.write(Self::ADDR, &[0x05, 0x04])?; // ALS_CS_GAIN: 18x gain
+        i2c.write(Self::ADDR, &[0x04, 0x40])   // ALS_CS_MEAS_RATE: 16-bit res, 25 ms rate
+    }
+
+    // Returns (r, g, b) normalized to 0-255
+    fn read<I: embedded_hal::i2c::I2c, D: embedded_hal::delay::DelayNs>(
+        i2c: &mut I,
+        delay: &mut D,
+    ) -> Result<(u8, u8, u8), I::Error> {
+        i2c.write(Self::ADDR, &[0x00, 0x06])?;  // MAIN_CTRL: enable RGB/CS mode
+        // Poll MAIN_STATUS (0x07) for CS data ready (bit 3)
+        let mut status = [0u8; 1];
+        for _ in 0..20u8 {
+            delay.delay_ms(5);
+            i2c.write_read(Self::ADDR, &[0x07], &mut status)?;
+            if status[0] & 0x08 != 0 { break; }
+        }
+        let mut buf = [0u8; 9];
+        i2c.write_read(Self::ADDR, &[0x0D], &mut buf)?; // burst read G, R, B (3 bytes each)
+        i2c.write(Self::ADDR, &[0x00, 0x00])?;          // MAIN_CTRL: standby
+        let g_raw = (buf[0] as u32) | ((buf[1] as u32) << 8) | ((buf[2] as u32) << 16);
+        let r_raw = (buf[3] as u32) | ((buf[4] as u32) << 8) | ((buf[5] as u32) << 16);
+        let b_raw = (buf[6] as u32) | ((buf[7] as u32) << 8) | ((buf[8] as u32) << 16);
+        Ok((
+            (r_raw.min(65535) * 255 / 65535) as u8,
+            (g_raw.min(65535) * 255 / 65535) as u8,
+            (b_raw.min(65535) * 255 / 65535) as u8,
+        ))
+    }
+}
+
 struct Sht30;
 
 impl Sht30 {
@@ -199,6 +236,7 @@ fn main() -> ! {
     );
     Lsm6ds3::init(&mut i2c1).unwrap();
     Mmc5603::init(&mut i2c1, &mut timer).unwrap();
+    Ltr381rgb::init(&mut i2c1).unwrap();
 
     // LED mode state
     let mut blinking = true;
@@ -228,6 +266,12 @@ fn main() -> ! {
     let mut mz: i32 = 0;
     let mut magneto_ticks: u32 = 20;
 
+    // Optical mode state
+    let mut opt_r: u8 = 0;
+    let mut opt_g: u8 = 0;
+    let mut opt_b: u8 = 0;
+    let mut optical_ticks: u32 = 20;
+
     loop {
         let now: u64 = timer.get_counter().ticks();
 
@@ -239,6 +283,7 @@ fn main() -> ! {
                 gyro_ticks = 0;
                 temp_ticks = 100;
                 magneto_ticks = 20;
+                optical_ticks = 20;
                 display_dirty = true;
             }
             Ok(Direction::CounterClockwise) => {
@@ -247,6 +292,7 @@ fn main() -> ! {
                 gyro_ticks = 0;
                 temp_ticks = 100;
                 magneto_ticks = 20;
+                optical_ticks = 20;
                 display_dirty = true;
             }
             _ => {}
@@ -297,6 +343,18 @@ fn main() -> ! {
             }
         }
 
+        // Optical mode: read sensor every ~200 ms
+        if MODES[mode_idx] == Mode::Optical {
+            optical_ticks += 1;
+            if optical_ticks >= 20 {
+                optical_ticks = 0;
+                if let Ok((r, g, b)) = Ltr381rgb::read(&mut i2c1, &mut timer) {
+                    opt_r = r; opt_g = g; opt_b = b;
+                    display_dirty = true;
+                }
+            }
+        }
+
         // Temp mode: read sensor every ~1 s (temp_ticks starts at threshold for quick first read)
         if MODES[mode_idx] == Mode::Temp {
             temp_ticks += 1;
@@ -342,6 +400,17 @@ fn main() -> ! {
                     Text::new(&xb, Point::new(0, 35), status_style).draw(&mut display).unwrap();
                     Text::new(&yb, Point::new(0, 47), status_style).draw(&mut display).unwrap();
                     Text::new(&zb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
+                }
+                Mode::Optical => {
+                    let mut rb: HString<16> = HString::new();
+                    let mut gb: HString<16> = HString::new();
+                    let mut bb: HString<16> = HString::new();
+                    write!(rb, "R:{:>4}", opt_r).ok();
+                    write!(gb, "G:{:>4}", opt_g).ok();
+                    write!(bb, "B:{:>4}", opt_b).ok();
+                    Text::new(&rb, Point::new(0, 35), status_style).draw(&mut display).unwrap();
+                    Text::new(&gb, Point::new(0, 47), status_style).draw(&mut display).unwrap();
+                    Text::new(&bb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
                 }
                 Mode::Temp => {
                     let mut tb: HString<16> = HString::new();
