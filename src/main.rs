@@ -201,6 +201,9 @@ fn main() -> ! {
     let mut led_pin = pins.gpio20.into_push_pull_output();
     let mut button = pins.gpio26.into_pull_up_input();
 
+    // PIR sensor (GP28, AS312 — active-high output)
+    let mut pir_pin = pins.gpio28.into_pull_down_input();
+
     // Rotary encoder (GP6 A, GP7 B)
     let enc_a = pins.gpio6.into_pull_up_input();
     let enc_b = pins.gpio7.into_pull_up_input();
@@ -271,6 +274,9 @@ fn main() -> ! {
     let mut opt_g: u8 = 0;
     let mut opt_b: u8 = 0;
     let mut optical_ticks: u32 = 20;
+
+    // PIR mode state
+    let mut pir_detected = false;
 
     loop {
         let now: u64 = timer.get_counter().ticks();
@@ -355,6 +361,15 @@ fn main() -> ! {
             }
         }
 
+        // PIR mode: update display on state change
+        if MODES[mode_idx] == Mode::Pir {
+            let detected = pir_pin.is_high().unwrap_or(false);
+            if detected != pir_detected {
+                pir_detected = detected;
+                display_dirty = true;
+            }
+        }
+
         // Temp mode: read sensor every ~1 s (temp_ticks starts at threshold for quick first read)
         if MODES[mode_idx] == Mode::Temp {
             temp_ticks += 1;
@@ -428,6 +443,7 @@ fn main() -> ! {
                 _ => {
                     let status = match mode {
                         Mode::Led => if blinking { "Blinking" } else { "Override" },
+                        Mode::Pir => if pir_detected { "Motion!" } else { "Clear" },
                         _         => "",
                     };
                     Text::new(status, Point::new(0, 50), status_style)
