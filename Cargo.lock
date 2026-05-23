@@ -12,6 +12,7 @@ dependencies = [
  "defmt-rtt",
  "embedded-graphics",
  "embedded-hal 1.0.0",
+ "heapless",
  "panic-probe",
  "rotary-encoder-hal",
  "rp-binary-info",

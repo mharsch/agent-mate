@@ -30,3 +30,6 @@ rotary-encoder-hal = { version = "0.6.0", features = ["table-decoder"] }
 # Defmt Logging
 defmt = "1.0.1"
 defmt-rtt = "1.1.0"
+
+# no_std string formatting
+heapless = "0.8"
