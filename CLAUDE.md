@@ -54,10 +54,10 @@ This is a `#![no_std]` / `#![no_main]` bare-metal crate — no OS, no allocator,
 | RGB LED | GP15 (R), GP16 (G), GP17 (B), GND |
 | Buzzer | GP18, GND |
 | Digital PIR Sensor | GP19, GND |
-| 0.96" OLED 128x64 | I2C1 — GP20 (SDA), GP21 (SCL) |
+| 0.96" OLED 128x64 | I2C0 — GP16 (SDA), GP17 (SCL) |
 | Digital Optical Sensor | SPI — GP11 (SCK), GP12 (TX), GP13 (RX), GP14 (CS) |
 
-Accelerometer, Magnetometer, and Temperature/Humidity share the I2C0 bus (GP4/GP5). The OLED uses a separate I2C1 bus (GP20/GP21).
+Accelerometer, Magnetometer, Temperature/Humidity, and OLED all map to **I2C0** in the RP2350 HAL. The sensors use GP4/GP5 and the OLED uses GP20/GP21 — both are valid I2C0 pin sets but cannot be driven by the same I2C0 instance simultaneously.
 
 ## Flashing Prerequisites
 

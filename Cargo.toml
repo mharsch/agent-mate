@@ -20,6 +20,13 @@ rp235x-hal = { version = "0.3.0", features = [
 ] }
 rp-binary-info = "0.1.1"
 
+# OLED display + graphics
+ssd1306 = "0.10.0"
+embedded-graphics = "0.8"
+
+# Rotary encoder
+rotary-encoder-hal = { version = "0.6.0", features = ["table-decoder"] }
+
 # Defmt Logging
 defmt = "1.0.1"
 defmt-rtt = "1.1.0"
