@@ -10,6 +10,8 @@ use core::fmt::Write;
 
 use rp235x_hal::clocks::ClockSource;
 use rp235x_hal::fugit::RateExtU32;
+use embedded_hal::pwm::SetDutyCycle;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use rotary_encoder_hal::{Direction, Rotary};
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 use embedded_graphics::{
@@ -241,6 +243,13 @@ fn main() -> ! {
     Mmc5603::init(&mut i2c1, &mut timer).unwrap();
     Ltr381rgb::init(&mut i2c1).unwrap();
 
+    // Buzzer PWM (GP27 → PWM slice 1, channel B on RP2350)
+    let pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
+    let mut buzz_pwm = pwm_slices.pwm5;
+    buzz_pwm.set_div_int(125u8); // 125 MHz / 125 = 1 MHz PWM clock
+    buzz_pwm.set_top(999u16);    // 1 MHz / 1000 = 1 kHz carrier
+    let _buzz_pin = buzz_pwm.channel_b.output_to(pins.gpio27);
+
     // LED mode state
     let mut blinking = true;
     let mut led_state = false;
@@ -278,6 +287,11 @@ fn main() -> ! {
     // PIR mode state
     let mut pir_detected = false;
 
+    // Buzz mode state
+    let mut buzz_duty: u16 = 0;
+    let mut buzz_display_ticks: u32 = 0;
+    let mut buzz_active = false;
+
     loop {
         let now: u64 = timer.get_counter().ticks();
 
@@ -290,6 +304,8 @@ fn main() -> ! {
                 temp_ticks = 100;
                 magneto_ticks = 20;
                 optical_ticks = 20;
+                buzz_duty = 0;
+                buzz_display_ticks = 0;
                 display_dirty = true;
             }
             Ok(Direction::CounterClockwise) => {
@@ -299,6 +315,8 @@ fn main() -> ! {
                 temp_ticks = 100;
                 magneto_ticks = 20;
                 optical_ticks = 20;
+                buzz_duty = 0;
+                buzz_display_ticks = 0;
                 display_dirty = true;
             }
             _ => {}
@@ -370,6 +388,29 @@ fn main() -> ! {
             }
         }
 
+        // Buzz mode: sweep duty 0..999 over 2 seconds using timer; disable PWM when not active
+        if MODES[mode_idx] == Mode::Buzz {
+            if !buzz_active {
+                buzz_pwm.enable();
+                buzz_active = true;
+            }
+            let new_duty = ((now % 2_000_000u64) / 2000) as u16;
+            if new_duty != buzz_duty {
+                buzz_duty = new_duty;
+                buzz_pwm.channel_b.set_duty_cycle(buzz_duty).ok();
+            }
+            buzz_display_ticks += 1;
+            if buzz_display_ticks >= 5 {
+                buzz_display_ticks = 0;
+                display_dirty = true;
+            }
+        } else if buzz_active {
+            buzz_pwm.channel_b.set_duty_cycle(0).ok();
+            buzz_pwm.disable();
+            buzz_duty = 0;
+            buzz_active = false;
+        }
+
         // Temp mode: read sensor every ~1 s (temp_ticks starts at threshold for quick first read)
         if MODES[mode_idx] == Mode::Temp {
             temp_ticks += 1;
@@ -439,6 +480,17 @@ fn main() -> ! {
                     write!(hb, "{}%RH", hum_pct).ok();
                     Text::new(&tb, Point::new(0, 42), label_style).draw(&mut display).unwrap();
                     Text::new(&hb, Point::new(0, 59), status_style).draw(&mut display).unwrap();
+                }
+                Mode::Buzz => {
+                    let bar_px = (buzz_duty as u32 * 126 / 999) as u32;
+                    Rectangle::new(Point::new(1, 35), Size::new(126, 12))
+                        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+                        .draw(&mut display).unwrap();
+                    if bar_px > 0 {
+                        Rectangle::new(Point::new(1, 35), Size::new(bar_px, 12))
+                            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                            .draw(&mut display).unwrap();
+                    }
                 }
                 _ => {
                     let status = match mode {
